@@ -15,7 +15,11 @@ public class PetriMonitor {
     private final List<Semaphore> conditionVariables;
 
     public PetriMonitor() {
-        this.petriNet = new PetriNet();
+        this(new InMemoryPetriNetState());
+    }
+
+    public PetriMonitor(IPetriNetState state) {
+        this.petriNet = new PetriNet(state);
         this.mutex = new Semaphore(1, true);
         conditionVariables = new ArrayList<>();
         for (int i = 0; i < petriNet.getTransitionsAmount(); i++) conditionVariables.add(new Semaphore(0));

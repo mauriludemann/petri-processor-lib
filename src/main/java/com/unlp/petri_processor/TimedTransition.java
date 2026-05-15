@@ -44,4 +44,13 @@ public class TimedTransition {
             uuidEnablingTime.put(uuid, enablingTime);
         }
     }
+
+    public Map<String, Long> getUuidEnablingTime() {
+        return uuidEnablingTime;
+    }
+
+    public void setUuidEnablingTime(Map<String, Long> uuidEnablingTimes) {
+        this.uuidEnablingTime.clear();
+        this.uuidEnablingTime.putAll(uuidEnablingTimes);
+    }
 }

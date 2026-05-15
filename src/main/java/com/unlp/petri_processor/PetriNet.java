@@ -3,6 +3,7 @@ package com.unlp.petri_processor;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -39,7 +40,14 @@ public class PetriNet {
     @Getter
     private List<Boolean> enabledTransitions;
 
+    private final IPetriNetState state;
+
     public PetriNet() {
+        this(new InMemoryPetriNetState());
+    }
+
+    public PetriNet(IPetriNetState state) {
+        this.state = state;
         this.randomDefaultPolicy = new RandomDefaultPolicy();
         ObjectMapper mapper = new ObjectMapper();
         mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
@@ -58,22 +66,29 @@ public class PetriNet {
         } catch (IOException ex) {
             throw new RuntimeException("Failed to load Petri net configuration", ex);
         }
-        currentMarking = INITIAL_MARKING;
+        currentMarking = Arrays.copyOf(INITIAL_MARKING, INITIAL_MARKING.length);
         enabledTransitions = new ArrayList<>(Collections.nCopies(getTransitionsAmount(), Boolean.FALSE));
-        saveEnabledTransitions(System.currentTimeMillis());
         uuidCurrentMarking = new HashMap<>();
         for (int i = 0; i < currentMarking.length; i++) {
             uuidCurrentMarking.put(i, new HashSet<>());
         }
+
+        // Si no hay estado previo, guarda el estado inicial
+        if (state.load() == null) {
+            saveEnabledTransitions(System.currentTimeMillis());
+            state.save(buildSnapshot());
+        }
     }
 
     public boolean fireTransition(PetriTransition petriTransition) {
+        loadCurrentState();
         if (isTimedTransition(petriTransition.getTransitionId()) && !TIMED_TRANSITIONS.get(petriTransition.getTransitionId()).canFire(System.currentTimeMillis())) {
             return false;
         }
         Long enablingTime = System.currentTimeMillis();
         updateMarking(petriTransition);
         saveEnabledTransitions(petriTransition, enablingTime);
+        state.save(buildSnapshot());
         return true;
     }
 
@@ -82,28 +97,19 @@ public class PetriNet {
     }
 
     public boolean isEnabled(PetriTransition petriTransition) {
-        int t = petriTransition.getTransitionId();
-        if (IntStream.range(0, currentMarking.length).anyMatch(i -> (currentMarking[i] - INCIDENCE_MATRIX_MINUS[i][t] + INCIDENCE_MATRIX_PLUS[i][t]) < 0)) {
-            return false;
-        }
-        // Si el UUID del PetriTransition es null, se considera recurso, está habilitado.
-        if (Objects.isNull(petriTransition.getUuid())) {
-            return true;
-        }
-        int[] minusVector = new int[INCIDENCE_MATRIX_MINUS.length];
-        for (int i = 0; i < INCIDENCE_MATRIX_MINUS.length; i++) {
-            minusVector[i] = INCIDENCE_MATRIX_MINUS[i][t];
-        }
-        for (int i = 0; i < minusVector.length; i++) {
-            if (minusVector[i] > 0 && !uuidCurrentMarking.get(i).contains(petriTransition.getUuid())) {
-                return false;
-            }
-        }
-        return true;
+        loadCurrentState();
+        return isEnabledInternal(petriTransition);
     }
 
     public TimedTransition getTimedTransition(Integer t) {
         return TIMED_TRANSITIONS.get(t);
+    }
+
+    private void loadCurrentState() {
+        PetriNetSnapshot snapshot = state.load();
+        if (snapshot != null) {
+            restoreFromSnapshot(snapshot);
+        }
     }
 
     private void updateMarking(PetriTransition petriTransition) {
@@ -142,7 +148,7 @@ public class PetriNet {
     private void saveEnabledTransitions(PetriTransition petriTransition, Long enablingTime) {
         // falta resolver aca, este vector de enabled transitions esta raro
         enabledTransitions = IntStream.range(0, getTransitionsAmount()).mapToObj((t) -> {
-            if (isEnabled(new PetriTransition(t, petriTransition.getUuid()))) {
+            if (isEnabledInternal(new PetriTransition(t, petriTransition.getUuid()))) {
                 if (isTimedTransition(t) && !enabledTransitions.get(t)) {
                     TIMED_TRANSITIONS.get(t).setEnablingTime(petriTransition.getUuid(), enablingTime);
                 }
@@ -156,7 +162,85 @@ public class PetriNet {
         saveEnabledTransitions(new PetriTransition(0, null), enablingTime);
     }
 
+    /**
+     * Versión interna de isEnabled que NO carga estado (para uso dentro de fireTransition
+     * donde el estado ya fue cargado).
+     */
+    private boolean isEnabledInternal(PetriTransition petriTransition) {
+        int t = petriTransition.getTransitionId();
+        if (IntStream.range(0, currentMarking.length).anyMatch(i -> (currentMarking[i] - INCIDENCE_MATRIX_MINUS[i][t] + INCIDENCE_MATRIX_PLUS[i][t]) < 0)) {
+            return false;
+        }
+        // Si el UUID del PetriTransition es null, se considera recurso, está habilitado.
+        if (Objects.isNull(petriTransition.getUuid())) {
+            return true;
+        }
+        int[] minusVector = new int[INCIDENCE_MATRIX_MINUS.length];
+        for (int i = 0; i < INCIDENCE_MATRIX_MINUS.length; i++) {
+            minusVector[i] = INCIDENCE_MATRIX_MINUS[i][t];
+        }
+        for (int i = 0; i < minusVector.length; i++) {
+            if (minusVector[i] > 0 && !uuidCurrentMarking.get(i).contains(petriTransition.getUuid())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private boolean isTimedTransition(int t) {
         return TIMED_TRANSITIONS.get(t) != null;
+    }
+
+    private PetriNetSnapshot buildSnapshot() {
+        Map<Integer, Set<String>> uuidCopy = new HashMap<>();
+        for (Map.Entry<Integer, Set<String>> entry : uuidCurrentMarking.entrySet()) {
+            uuidCopy.put(entry.getKey(), new HashSet<>(entry.getValue()));
+        }
+
+        Map<Integer, Long> timedEnablingTimes = new HashMap<>();
+        Map<Integer, Map<String, Long>> timedUuidEnablingTimes = new HashMap<>();
+        for (int i = 0; i < TIMED_TRANSITIONS.size(); i++) {
+            TimedTransition tt = TIMED_TRANSITIONS.get(i);
+            if (tt != null) {
+                timedEnablingTimes.put(i, tt.getEnablingTime(null));
+                timedUuidEnablingTimes.put(i, new HashMap<>(tt.getUuidEnablingTime()));
+            }
+        }
+
+        return new PetriNetSnapshot(
+            Arrays.copyOf(currentMarking, currentMarking.length),
+            uuidCopy,
+            new ArrayList<>(enabledTransitions),
+            timedEnablingTimes,
+            timedUuidEnablingTimes
+        );
+    }
+
+    private void restoreFromSnapshot(PetriNetSnapshot snapshot) {
+        System.arraycopy(snapshot.currentMarking(), 0, currentMarking, 0, currentMarking.length);
+
+        for (Map.Entry<Integer, Set<String>> entry : uuidCurrentMarking.entrySet()) {
+            entry.getValue().clear();
+        }
+        for (Map.Entry<Integer, Set<String>> entry : snapshot.uuidCurrentMarking().entrySet()) {
+            uuidCurrentMarking.get(entry.getKey()).addAll(entry.getValue());
+        }
+
+        enabledTransitions.clear();
+        enabledTransitions.addAll(snapshot.enabledTransitions());
+
+        for (Map.Entry<Integer, Long> entry : snapshot.timedTransitionEnablingTimes().entrySet()) {
+            TimedTransition tt = TIMED_TRANSITIONS.get(entry.getKey());
+            if (tt != null) {
+                tt.setEnablingTime(null, entry.getValue());
+            }
+        }
+
+        for (Map.Entry<Integer, Map<String, Long>> entry : snapshot.timedTransitionUuidEnablingTimes().entrySet()) {
+            TimedTransition tt = TIMED_TRANSITIONS.get(entry.getKey());
+            if (tt != null) {
+                tt.setUuidEnablingTime(entry.getValue());
+            }
+        }
     }
 }

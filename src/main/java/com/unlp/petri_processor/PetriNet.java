@@ -101,6 +101,14 @@ public class PetriNet {
         return isEnabledInternal(petriTransition);
     }
 
+    public List<Boolean> getStructurallyEnabledTransitions() {
+        loadCurrentState();
+        return IntStream.range(0, getTransitionsAmount()).mapToObj(t ->
+            IntStream.range(0, currentMarking.length)
+                .noneMatch(i -> currentMarking[i] - INCIDENCE_MATRIX_MINUS[i][t] + INCIDENCE_MATRIX_PLUS[i][t] < 0)
+        ).collect(Collectors.toList());
+    }
+
     public TimedTransition getTimedTransition(Integer t) {
         return TIMED_TRANSITIONS.get(t);
     }

@@ -34,7 +34,11 @@ public class TimedTransition {
         if (Objects.isNull(uuid)) {
             return enablingTime;
         }
-        return uuidEnablingTime.get(uuid);
+        Long time = uuidEnablingTime.get(uuid);
+        if (Objects.isNull(time)) {
+            return System.currentTimeMillis();
+        }
+        return time;
     }
 
     public void setEnablingTime(String uuid, Long enablingTime) {

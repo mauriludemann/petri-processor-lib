@@ -1,10 +1,9 @@
 package com.unlp.petri_processor;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 
 import com.unlp.petri_processor.exceptions.PetriMonitorException;
 
@@ -12,7 +11,18 @@ public class PetriMonitor {
 
     private final PetriNet petriNet;
     private final Semaphore mutex;
-    private final List<Semaphore> conditionVariables;
+    private final ConcurrentHashMap<String, Semaphore> uuidConditionVariables;
+
+    /**
+     * Set de claves (transición:uuid) que indica intención de dormir.
+     * Se marca ANTES de soltar el mutex en goToSleep, y se consulta en
+     * signalNextOrReleaseMutex (que también tiene el mutex).
+     *
+     * Resuelve el race condition entre mutex.release() y sem.acquire():
+     * sin este set, un hilo que soltó el mutex pero no llegó a sem.acquire()
+     * no es visible para hasQueuedThreads(), y el wakeup se pierde.
+     */
+    private final Set<String> waitingThreads = ConcurrentHashMap.newKeySet();
 
     public PetriMonitor() {
         this(new InMemoryPetriNetState());
@@ -21,8 +31,7 @@ public class PetriMonitor {
     public PetriMonitor(IPetriNetState state) {
         this.petriNet = new PetriNet(state);
         this.mutex = new Semaphore(1, true);
-        conditionVariables = new ArrayList<>();
-        for (int i = 0; i < petriNet.getTransitionsAmount(); i++) conditionVariables.add(new Semaphore(0));
+        this.uuidConditionVariables = new ConcurrentHashMap<>();
     }
 
     public void fire(PetriTransition petriTransition) throws PetriMonitorException {
@@ -33,24 +42,10 @@ public class PetriMonitor {
             throw new PetriMonitorException("Unexpected error while acquiring mutex");
         }
         boolean fired = false;
-        while(!fired) {
+        while (!fired) {
             if (petriNet.isEnabled(petriTransition)) {
                 if (petriNet.fireTransition(petriTransition)) {
-                    //log.info("Fired T {} with UUID {}. Current marking: {}", petriTransition.getTransitionId(), petriTransition.getUuid(), Arrays.toString(petriNet.getCurrentMarking()));
-                    //Obtiene las transiciones sensibilizadas
-                    List<Boolean> enabledTransitions = petriNet.getEnabledTransitions();
-                    //Obtiene las transiciones que tienen hilos durmiendo
-                    List<Boolean> queuedTransitions = getConditionVariablesStatus();
-                    //And lógico entre las dos listas anteriores
-                    List<Boolean> transitionsToRelease = logicAnd(enabledTransitions, queuedTransitions);
-                    if (transitionsToRelease.stream().anyMatch(Boolean::booleanValue)) {
-                        //Obtiene de la política, la próxima transición a disparar
-                        Integer nextTransitionToFire = petriNet.getRandomDefaultPolicy().whoIsNext(transitionsToRelease);
-                        //Despierta de las colas de condición, al hilo de la transición que eligió la política
-                        conditionVariables.get(nextTransitionToFire).release();
-                    } else {
-                        mutex.release();
-                    }
+                    signalNextOrReleaseMutex();
                     fired = true;
                 } else {
                     try {
@@ -65,26 +60,68 @@ public class PetriMonitor {
                     }
                 }
             } else {
-                goToSleep(petriTransition.getTransitionId());
+                goToSleep(petriTransition.getTransitionId(), petriTransition.getUuid());
             }
         }
+        // Limpia la variable de condición y el flag de este (transición, uuid)
+        String key = condKey(petriTransition.getTransitionId(), petriTransition.getUuid());
+        waitingThreads.remove(key);
+        uuidConditionVariables.remove(key);
     }
 
-    private void goToSleep(Integer transition) {
+    private String condKey(int transition, String uuid) {
+        return transition + ":" + (uuid != null ? uuid : "null");
+    }
+
+    /**
+     * Duerme al hilo en una variable de condición específica para su (transición, UUID).
+     *
+     * Registra la intención de dormir en waitingThreads ANTES de soltar el mutex.
+     * Así, signalNextOrReleaseMutex (que tiene el mutex) siempre ve al hilo como
+     * "esperando" incluso si aún no llegó a sem.acquire().
+     *
+     * Si el permit se libera antes de que el hilo llame sem.acquire(),
+     * el permit se acumula en el semáforo y acquire() retorna inmediatamente.
+     */
+    private void goToSleep(int transition, String uuid) {
+        String key = condKey(transition, uuid);
+        Semaphore sem = uuidConditionVariables.computeIfAbsent(key, k -> new Semaphore(0));
+        waitingThreads.add(key);  // Marcar intención ANTES de soltar mutex
         try {
-            //Si la transición a disparar no estaba sensibilizada, libera el mutex y se duerme en la cola de condición
             mutex.release();
-            conditionVariables.get(transition).acquire();
+            sem.acquire();
+            // Al despertar: el hilo tiene el mutex (pasado por el señalizador).
+            // Limpia el flag de espera para que signalNext no lo considere de nuevo.
+            waitingThreads.remove(key);
         } catch (InterruptedException e) {
-            System.out.printf("I was interrupted when sleeping in transition %s%n", transition);
+            waitingThreads.remove(key);
+            System.out.printf("I was interrupted when sleeping in transition %s, uuid %s%n", transition, uuid);
         }
     }
 
-    private List<Boolean> getConditionVariablesStatus() {
-        return conditionVariables.stream().map(Semaphore::hasQueuedThreads).collect(Collectors.toList());
-    }
-
-    private List<Boolean> logicAnd(List<Boolean> list1, List<Boolean> list2) {
-        return IntStream.range(0, list1.size()).mapToObj(i -> list1.get(i) && list2.get(i)).collect(Collectors.toList());
+    /**
+     * Busca un hilo esperando cuya transición esté habilitada para su UUID.
+     * Usa waitingThreads (intención de dormir) en lugar de hasQueuedThreads()
+     * para evitar el race condition entre mutex.release() y sem.acquire().
+     *
+     * Si encuentra uno, libera su semáforo (pasándole la sección crítica).
+     * Si no encuentra ninguno, libera el mutex.
+     */
+    private void signalNextOrReleaseMutex() {
+        for (String key : waitingThreads) {
+            Semaphore sem = uuidConditionVariables.get(key);
+            if (sem != null) {
+                String[] parts = key.split(":", 2);
+                int transitionId = Integer.parseInt(parts[0]);
+                String uuid = "null".equals(parts[1]) ? null : parts[1];
+                PetriTransition pt = new PetriTransition(transitionId, uuid);
+                if (petriNet.isEnabled(pt)) {
+                    waitingThreads.remove(key);  // Limpiar antes de despertar
+                    sem.release();
+                    return;  // Mutex pasado al hilo despertado
+                }
+            }
+        }
+        mutex.release();
     }
 }

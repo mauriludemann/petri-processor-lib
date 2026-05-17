@@ -1,0 +1,97 @@
+@startuml
+skinparam componentStyle rectangle
+skinparam classAttributeIconSize 0
+skinparam defaultFontName "Segoe UI"
+skinparam classFontSize 13
+skinparam classAttributeFontSize 11
+skinparam arrowThickness 1.2
+skinparam packageStyle rectangle
+package "petri_processor" {
+  ' === Fila 1: PetriMonitor ===
+  class PetriMonitor {
+    - petriNet: PetriNet
+    - mutex: Semaphore
+    - conditionVariables: List<Semaphore>
+    --
+    + fire(PetriTransition): void
+    - goToSleep(Integer): void
+    - getConditionVariablesStatus(): List<Boolean>
+    - logicAnd(List<Boolean>, List<Boolean>): List<Boolean>
+  }
+  ' === Fila 2: PetriNet (centro), PetriTransition (derecha) ===
+  class PetriNet {
+    - {static} INCIDENCE_MATRIX_PLUS: int[][]
+    - {static} INCIDENCE_MATRIX_MINUS: int[][]
+    - {static} INITIAL_MARKING: int[]
+    - {static} TIMED_TRANSITIONS: List<TimedTransition>
+    - currentMarking: int[]
+    - uuidCurrentMarking: Map<Integer, Set<String>>
+    - enabledTransitions: List<Boolean>
+    - state: IPetriNetState
+    --
+    + fireTransition(PetriTransition): boolean
+    + isEnabled(PetriTransition): boolean
+    + getTransitionsAmount(): Integer
+    + getTimedTransition(Integer): TimedTransition
+    - updateMarking(PetriTransition): void
+    - loadCurrentState(): void
+    - buildSnapshot(): PetriNetSnapshot
+    - restoreFromSnapshot(PetriNetSnapshot): void
+  }
+  class PetriTransition {
+    - transitionId: int
+    - uuid: String
+  }
+  ' === Fila 3: IPetriNetState, TimedTransition, RandomDefaultPolicy, PetriNetConfig ===
+  interface IPetriNetState <<interface>> {
+    + save(PetriNetSnapshot): void
+    + load(): PetriNetSnapshot
+  }
+  class TimedTransition {
+    - alpha: Long
+    - beta: Long
+    - uuidEnablingTime: Map<String, Long>
+    --
+    + canFire(Long): boolean
+    + setEnablingTime(String, Long): void
+  }
+  class RandomDefaultPolicy {
+    + whoIsNext(List<Boolean>): Integer
+  }
+  class PetriNetConfig {
+    - matrizIPlus: List<List<Integer>>
+    - matrizIMinus: List<List<Integer>>
+    - initialMarking: List<Integer>
+    - timedTransitions: List<TimedTransitionConfig>
+    - mapPlacesToIndex: Map<String, Integer>
+    - mapTransitionsToIndex: Map<String, Integer>
+  }
+  ' === Fila 4: PetriNetSnapshot, IPetriPolicy ===
+  class PetriNetSnapshot <<record>> {
+    currentMarking: int[]
+    uuidCurrentMarking: Map<Integer, Set<String>>
+    enabledTransitions: List<Boolean>
+    timedTransitionEnablingTimes: Map<Integer, Long>
+    timedTransitionUuidEnablingTimes: Map<Integer, Map<String, Long>>
+  }
+  interface IPetriPolicy <<interface>> {
+    + whoIsNext(List<Boolean>): Integer
+  }
+  ' === Relaciones principales ===
+  PetriMonitor *-down- PetriNet
+  PetriMonitor ..right.> PetriTransition : <<fires>>
+  PetriNet *-left- "1" IPetriNetState
+  PetriNet *-down- "*" TimedTransition
+  PetriNet *-down- "1" RandomDefaultPolicy
+  PetriNet ..right.> PetriTransition : <<uses>>
+  PetriNet ..down.> PetriNetConfig : <<reads>>
+  PetriNet ..down.> PetriNetSnapshot : <<creates>>
+  IPetriNetState ..down.> PetriNetSnapshot : <<uses>>
+  RandomDefaultPolicy .down.|> IPetriPolicy
+  ' === Layout oculto para alinear ===
+  IPetriNetState -[hidden]right- TimedTransition
+  TimedTransition -[hidden]right- RandomDefaultPolicy
+  RandomDefaultPolicy -[hidden]right- PetriNetConfig
+  PetriNetSnapshot -[hidden]right- IPetriPolicy
+}
+@enduml
